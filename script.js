@@ -1,0 +1,512 @@
+// --- KONFIGURASI SUPABASE (SUDAH DIISI, JANGAN DIUBAH) ---
+const supabaseUrl = 'https://hysjbwysizpczgcsqvuv.supabase.co';
+const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imh5c2pid3lzaXpwY3pnY3NxdnV2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3MzI0MTg2NDEsImV4cCI6MjA0Nzk5NDY0MX0.sLSfXMn9htsinETKUJ5IAsZ2l774rfeaNNmB7mVQcR4';
+const supabase = supabase.createClient(supabaseUrl, supabaseKey);
+
+// Cache Data
+let allMembersCache = []; 
+
+// --- GLOBAL VARIABLES ---
+let diagram = null;
+let growthChart = null; 
+let memberListSortColumn = 'joinDate'; 
+let memberListSortDirection = 'asc';
+let memberListFilterUid = null; 
+
+document.addEventListener('DOMContentLoaded', async () => {
+    const path = window.location.pathname;
+
+    // --- PROTEKSI LOGIN ---
+    const isLoggedIn = sessionStorage.getItem('isLoggedIn');
+    if (!isLoggedIn && !path.includes('index.html') && !path.endsWith('/')) {
+        window.location.href = 'index.html';
+        return; 
+    }
+
+    if (path.includes('dashboard.html') || path.includes('network.html')) {
+        if (isLoggedIn) ensureFullScreen();
+        
+        // LOAD DATA DARI SUPABASE (MAPPING OTOMATIS)
+        await fetchMembersFromSupabase();
+
+        if (path.includes('dashboard.html')) {
+            initializeDashboard();
+        } else if (path.includes('network.html')) {
+            initializeNetworkPage();
+        }
+    } else if (path.includes('index.html') || path.endsWith('/')) {
+        document.getElementById('loginButton').addEventListener('click', login);
+    }
+});
+
+// --- FUNGSI UTAMA: AMBIL DATA DARI SUPABASE (KOLOM INDONESIA -> INGGRIS) ---
+async function fetchMembersFromSupabase() {
+    try {
+        const { data, error } = await supabase
+            .from('members') // Mengambil dari tabel 'members'
+            .select('*');
+            
+        if (error) throw error;
+
+        // MAPPING PENTING: Ubah kolom Indonesia (Database) ke Inggris (Aplikasi)
+        allMembersCache = data.map(m => ({
+            name: m.Nama,                 // Kolom DB 'Nama'
+            uid: String(m.UID),           // Kolom DB 'UID' (Pastikan jadi teks)
+            upline: m.Upline,             // Kolom DB 'Upline'
+            joinDate: m.TanggalBergabung || new Date().toISOString() // Kolom DB 'TanggalBergabung'
+        }));
+
+        return allMembersCache;
+    } catch (error) {
+        console.error("Error ambil data:", error);
+        showNotification("Gagal mengambil data database.");
+        return [];
+    }
+}
+
+function loadMembers() { return allMembersCache; }
+function saveMembers(members) { /* Tidak dipakai lagi karena sudah online */ }
+
+// --- TAMBAH ANGGOTA (Kirim pakai Bahasa Indonesia) ---
+async function addMember() {
+    const name = document.getElementById('name').value.trim();
+    const uid = document.getElementById('uid').value.trim();
+    const upline = document.getElementById('upline').value.trim();
+    const joinDateValue = document.getElementById('joinDateInput').value;
+
+    if (!name || !uid) return showNotification("Nama dan UID wajib diisi!");
+    if (allMembersCache.some(m => m.uid === uid)) return showNotification("UID sudah terdaftar!");
+
+    const joinDate = joinDateValue ? new Date(joinDateValue).toISOString() : new Date().toISOString();
+    
+    const btn = document.getElementById('addMemberButton');
+    btn.textContent = "Menyimpan...";
+    btn.disabled = true;
+
+    // KIRIM KE SUPABASE (Format Kolom Indonesia)
+    const { error } = await supabase
+        .from('members')
+        .insert([{ 
+            Nama: name, 
+            UID: uid, 
+            Upline: upline || null, 
+            TanggalBergabung: joinDate 
+        }]);
+
+    if (error) {
+        showNotification("Gagal simpan: " + error.message);
+    } else {
+        showNotification("Berhasil disimpan!");
+        ['name', 'uid', 'upline', 'joinDateInput'].forEach(id => document.getElementById(id).value = '');
+        await fetchMembersFromSupabase(); // Refresh data
+        updateCount(); searchMembers(); renderGrowthChart();
+    }
+    btn.textContent = "Tambah Anggota";
+    btn.disabled = false;
+}
+
+// --- EDIT ANGGOTA (Update pakai Bahasa Indonesia) ---
+async function saveEditedMember() {
+    const originalUid = document.getElementById('originalUid').value;
+    const newName = document.getElementById('editName').value.trim();
+    const newUid = document.getElementById('editUid').value.trim();
+    const newUpline = document.getElementById('editUpline').value.trim();
+    const newJoinDate = document.getElementById('editJoinDate').value;
+
+    if (!newName || !newUid) return showNotification("Data tidak boleh kosong!");
+    
+    const btn = document.getElementById('saveEditButton');
+    btn.textContent = "Menyimpan...";
+    btn.disabled = true;
+
+    // Update Data Utama
+    const updates = {
+        Nama: newName,
+        UID: newUid,
+        Upline: newUpline || null,
+        TanggalBergabung: newJoinDate ? new Date(newJoinDate).toISOString() : null
+    };
+
+    const { error } = await supabase
+        .from('members')
+        .update(updates)
+        .eq('UID', originalUid);
+
+    if (error) {
+        showNotification("Gagal update: " + error.message);
+    } else {
+        // Update Downline jika UID berubah
+        if (originalUid !== newUid) {
+             await supabase
+                .from('members')
+                .update({ Upline: newUid }) 
+                .eq('Upline', originalUid);
+        }
+        closeEditModal();
+        showNotification("Data diperbarui.");
+        await fetchMembersFromSupabase();
+        searchMembers(); renderGrowthChart();
+    }
+    btn.textContent = "Simpan Perubahan";
+    btn.disabled = false;
+}
+
+// --- HAPUS ANGGOTA ---
+async function deleteMember(uid) {
+    // Putuskan hubungan upline
+    await supabase.from('members').update({ Upline: null }).eq('Upline', uid);
+    
+    // Hapus data
+    const { error } = await supabase.from('members').delete().eq('UID', uid);
+
+    if (error) {
+        showNotification("Gagal hapus: " + error.message);
+    } else {
+        showNotification("Anggota dihapus.");
+        await fetchMembersFromSupabase();
+        updateCount(); searchMembers(); renderGrowthChart();
+    }
+}
+
+// --- FUNGSI STANDAR LAINNYA (TIDAK PERLU DIUBAH) ---
+function initializeDashboard() {
+    updateCount();
+    renderGrowthChart();
+    document.getElementById('chartPeriodSelector').addEventListener('change', renderGrowthChart);
+    document.getElementById('addMemberButton').addEventListener('click', addMember);
+    document.getElementById('searchButton').addEventListener('click', searchMembers);
+    document.getElementById('resetButton').addEventListener('click', resetSearch);
+    
+    // Upload CSV Lokal disembunyikan karena sudah pakai Database
+    document.getElementById('uploadButton').style.display = 'none'; 
+    document.getElementById('csvFile').style.display = 'none';
+    
+    document.getElementById('viewNetworkButton').addEventListener('click', () => { window.location.href = 'network.html'; });
+    document.getElementById('viewMemberListButton').addEventListener('click', () => showMemberList(null));
+    document.getElementById('backToDashboardButton').addEventListener('click', showMainDashboard);
+    setupTableSorting(); 
+    document.getElementById('downloadButton').addEventListener('click', downloadCSV);
+    document.getElementById('saveEditButton').addEventListener('click', saveEditedMember);
+    document.getElementById('cancelEditButton').addEventListener('click', closeEditModal);
+    document.getElementById('logoutButton').addEventListener('click', logout);
+}
+
+function initializeNetworkPage() {
+    renderNetwork();
+    document.getElementById('backButton').addEventListener('click', () => { window.location.href = 'dashboard.html'; });
+    document.getElementById('downloadNetworkButton').addEventListener('click', downloadNetworkImage);
+}
+
+function showNotification(message, duration = 3000) {
+    let notification = document.getElementById('notification');
+    if (!notification) return;
+    notification.textContent = message;
+    notification.classList.add('show');
+    setTimeout(() => notification.classList.remove('show'), duration);
+}
+
+function openEditModal(uid) {
+    const member = loadMembers().find(m => m.uid === uid);
+    if (!member) return;
+    document.getElementById('originalUid').value = member.uid;
+    document.getElementById('editName').value = member.name;
+    document.getElementById('editUid').value = member.uid;
+    document.getElementById('editUpline').value = member.upline || '';
+    document.getElementById('editJoinDate').value = member.joinDate ? member.joinDate.split('T')[0] : '';
+    document.getElementById('editModal').style.display = 'flex';
+}
+
+function closeEditModal() { document.getElementById('editModal').style.display = 'none'; }
+
+function openConfirmModal(uid) {
+    const modal = document.getElementById('confirmModal');
+    const confirmBtn = document.getElementById('confirmDeleteButton');
+    const cancelBtn = document.getElementById('cancelDeleteButton');
+    modal.style.display = 'flex';
+    const newConfirmBtn = confirmBtn.cloneNode(true);
+    confirmBtn.parentNode.replaceChild(newConfirmBtn, confirmBtn);
+    newConfirmBtn.addEventListener('click', () => { deleteMember(uid); modal.style.display = 'none'; });
+    cancelBtn.addEventListener('click', () => { modal.style.display = 'none'; });
+}
+
+function requestFullScreen() {
+    const element = document.documentElement;
+    if (element.requestFullscreen) element.requestFullscreen();
+}
+function exitFullScreen() {
+    if (document.exitFullscreen) document.exitFullscreen();
+}
+function ensureFullScreen() {
+    if (!document.fullscreenElement) requestFullScreen();
+}
+
+function login() {
+    const user = document.getElementById('username').value;
+    const pass = document.getElementById('password').value;
+    if (user === 'admin' && pass === 'dvteam123') {
+        sessionStorage.setItem('isLoggedIn', 'true');
+        requestFullScreen();
+        setTimeout(() => { window.location.href = 'dashboard.html'; }, 150);
+    } else {
+        document.getElementById('error').innerText = 'Login gagal!';
+    }
+}
+
+function logout() {
+    sessionStorage.removeItem('isLoggedIn');
+    exitFullScreen();
+    window.location.href = 'index.html';
+}
+
+function updateCount() {
+    const el = document.getElementById('totalMembers');
+    if (el) el.textContent = loadMembers().length;
+}
+
+function downloadCSV() {
+    const members = loadMembers();
+    if (members.length === 0) return showNotification("Belum ada data!");
+    let csv = "Nama,UID,Upline,TanggalBergabung\n";
+    members.forEach(m => {
+        const name = `"${m.name.replace(/"/g, '""')}"`;
+        const joinDate = m.joinDate ? m.joinDate.split('T')[0] : '';
+        csv += `${name},${m.uid},${m.upline || ''},${joinDate}\n`;
+    });
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = 'data_anggota_dvteam.csv';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+}
+
+function searchMembers() {
+    const searchTerm = document.getElementById('searchTerm').value.toLowerCase();
+    const allMembers = loadMembers(); 
+    const results = allMembers.filter(member => {
+        return searchTerm === '' || member.name.toLowerCase().includes(searchTerm) || member.uid.toLowerCase().includes(searchTerm);
+    });
+    displaySearchResults(results.reverse(), allMembers);
+}
+
+function getDownlineCount(allMembersList, parentUid) {
+    const directChildren = allMembersList.filter(m => m.upline === parentUid);
+    let count = directChildren.length; 
+    for (const child of directChildren) {
+        count += getDownlineCount(allMembersList, child.uid); 
+    }
+    return count;
+}
+
+function getDownlineHierarchyFlat(allMembersList, parentUid) {
+    let list = [];
+    const directChildren = allMembersList.filter(m => m.upline === parentUid);
+    for (const child of directChildren) {
+        list.push(child);
+        list = list.concat(getDownlineHierarchyFlat(allMembersList, child.uid));
+    }
+    return list;
+}
+
+function displaySearchResults(results, allMembers) {
+    const container = document.getElementById('searchResultsContainer');
+    if (results.length === 0) {
+        container.innerHTML = '<p style="text-align:center; color: #888;">Tidak ada anggota ditemukan.</p>';
+        return;
+    }
+    let html = `<h4 style="margin-top: 20px;">Hasil (${results.length})</h4>`;
+    results.forEach(member => {
+        const joinDate = member.joinDate ? new Date(member.joinDate).toLocaleDateString('id-ID') : 'N/A';
+        const uplineMember = allMembers.find(m => m.uid === member.upline);
+        const uplineName = uplineMember ? uplineMember.name : '-';
+        const downlineCount = getDownlineCount(allMembers, member.uid);
+        
+        html += `
+            <div class="result-card">
+                <div class="result-info"><span class="info-label">Nama:</span><span class="info-value">${member.name}</span></div>
+                <div class="result-info"><span class="info-label">UID:</span><span class="info-value">${member.uid}</span></div>
+                <div class="result-info"><span class="info-label">Upline:</span><span class="info-value">${uplineName} (${member.upline || '-'})</span></div>
+                <div class="result-info"><span class="info-label">Tgl Gabung:</span><span class="info-value">${joinDate}</span></div>
+                <div class="result-info"><span class="info-label">Total Anggota:</span><span class="info-value">${downlineCount}</span></div>
+                <div class="result-actions">
+                    <button class="btn-edit" onclick="openEditModal('${member.uid}')">Edit</button>
+                    <button class="btn-delete" onclick="openConfirmModal('${member.uid}')">Hapus</button>
+                    <button onclick="sessionStorage.setItem('focusedMemberUid', '${member.uid}'); window.location.href='network.html';">Lihat Jaringan</button>
+                    <button onclick="showMemberList('${member.uid}')">Lihat Daftar</button>
+                </div>
+            </div>
+        `;
+    });
+    container.innerHTML = html;
+}
+
+function resetSearch() {
+    document.getElementById('searchTerm').value = '';
+    document.getElementById('searchResultsContainer').innerHTML = '';
+}
+
+function showMainDashboard() {
+    document.getElementById('mainDashboardContent').style.display = 'block';
+    document.getElementById('memberListContainer').style.display = 'none';
+}
+
+function showMemberList(uid = null) {
+    memberListFilterUid = uid;
+    document.getElementById('mainDashboardContent').style.display = 'none';
+    document.getElementById('memberListContainer').style.display = 'block';
+    renderMemberList(); 
+}
+
+function setupTableSorting() {
+    document.querySelectorAll('#memberListTable th.sortable-header').forEach(header => {
+        header.addEventListener('click', () => {
+            const newSortColumn = header.getAttribute('data-sort');
+            if (newSortColumn === memberListSortColumn) {
+                memberListSortDirection = (memberListSortDirection === 'asc') ? 'desc' : 'asc';
+            } else {
+                memberListSortColumn = newSortColumn;
+                memberListSortDirection = 'asc';
+            }
+            renderMemberList();
+        });
+    });
+}
+
+function renderMemberList() {
+    const allMembers = loadMembers();
+    const tbody = document.getElementById('memberListTableBody');
+    tbody.innerHTML = ''; 
+    let membersToRender = [];
+    if (memberListFilterUid) {
+        const rootMember = allMembers.find(m => m.uid === memberListFilterUid);
+        if (rootMember) {
+            const downlines = getDownlineHierarchyFlat(allMembers, memberListFilterUid);
+            membersToRender = [rootMember, ...downlines];
+        }
+    } else {
+        membersToRender = [...allMembers];
+    }
+
+    let sortedMembers = membersToRender.sort((a, b) => {
+        let valA, valB;
+        switch (memberListSortColumn) {
+            case 'name': valA = a.name.toLowerCase(); valB = b.name.toLowerCase(); break;
+            case 'uid': valA = a.uid.toLowerCase(); valB = b.uid.toLowerCase(); break;
+            case 'upline': valA = (a.upline || '').toLowerCase(); valB = (b.upline || '').toLowerCase(); break;
+            default: valA = new Date(a.joinDate); valB = new Date(b.joinDate); break;
+        }
+        if (valA < valB) return (memberListSortDirection === 'asc') ? -1 : 1;
+        if (valA > valB) return (memberListSortDirection === 'asc') ? 1 : -1;
+        return 0;
+    });
+
+    sortedMembers.forEach((member, index) => {
+        const joinDate = member.joinDate ? new Date(member.joinDate).toLocaleDateString('id-ID') : 'N/A';
+        const row = `<tr><td>${index + 1}</td><td>${member.name}</td><td>${member.uid}</td><td>${member.upline || '-'}</td><td>${joinDate}</td></tr>`;
+        tbody.innerHTML += row;
+    });
+}
+
+function renderGrowthChart() {
+    const members = loadMembers();
+    const ctx = document.getElementById('growthChart').getContext('2d');
+    if (growthChart) growthChart.destroy();
+    if (members.length === 0) return;
+
+    members.sort((a, b) => new Date(a.joinDate) - new Date(b.joinDate));
+    const periods = {};
+    const firstDate = new Date(members[0].joinDate);
+    const lastDate = new Date();
+    let currentDate = new Date(firstDate.getFullYear(), firstDate.getMonth(), 1);
+    while (currentDate <= lastDate) {
+        const year = currentDate.getFullYear();
+        const month = currentDate.getMonth() + 1;
+        periods[`${year}-${month}-P1`] = 0;
+        periods[`${year}-${month}-P2`] = 0;
+        currentDate.setMonth(currentDate.getMonth() + 1);
+    }
+    members.forEach(member => {
+        const joinDate = new Date(member.joinDate);
+        if(!isNaN(joinDate)) {
+             const key = `${joinDate.getFullYear()}-${joinDate.getMonth() + 1}-${joinDate.getDate() <= 15 ? 'P1' : 'P2'}`;
+             if (periods.hasOwnProperty(key)) periods[key]++;
+        }
+    });
+    const labels = [];
+    const periodData = [];
+    Object.keys(periods).forEach(key => {
+        const [year, month, period] = key.split('-');
+        const monthName = new Date(year, month - 1).toLocaleString('id-ID', { month: 'short' });
+        labels.push(`${monthName} ${year} (${period})`);
+        periodData.push(periods[key]);
+    });
+    
+    const numPeriodsToShow = parseInt(document.getElementById('chartPeriodSelector').value, 10);
+    const finalLabels = numPeriodsToShow > 0 ? labels.slice(-numPeriodsToShow) : labels;
+    const finalData = numPeriodsToShow > 0 ? periodData.slice(-numPeriodsToShow) : periodData;
+
+    growthChart = new Chart(ctx, {
+        type: 'bar',
+        data: { labels: finalLabels, datasets: [{ label: 'Anggota Baru', data: finalData, backgroundColor: 'rgba(255, 215, 0, 0.7)', borderColor: 'gold', borderWidth: 1 }] },
+        options: { responsive: true, scales: { y: { beginAtZero: true, ticks: { color: '#ccc'} }, x: { ticks: { color: '#ccc'} } }, plugins: { legend: { display: false } } }
+    });
+}
+
+function renderNetwork() {
+    const $ = go.GraphObject.make;
+    if (diagram) diagram.div = null;
+    diagram = $(go.Diagram, "networkDiagram", { layout: $(go.TreeLayout, { angle: 0, layerSpacing: 100 }), "undoManager.isEnabled": true });
+
+    const allMembers = loadMembers();
+    if (allMembers.length === 0) return;
+
+    const focusedMemberUid = sessionStorage.getItem('focusedMemberUid');
+    let membersToRender = allMembers;
+    
+    if (focusedMemberUid) {
+        const rootMember = allMembers.find(m => m.uid === focusedMemberUid);
+        if (rootMember) {
+            const getDH = (list, parentUid) => {
+                let d = [];
+                const c = list.filter(m => m.upline === parentUid);
+                for (const child of c) { d.push(child); d = d.concat(getDH(list, child.uid)); }
+                return d;
+            };
+            membersToRender = [rootMember, ...getDH(allMembers, focusedMemberUid)];
+        }
+    }
+
+    const downlineCounts = {};
+    allMembers.forEach(m => downlineCounts[m.uid] = 0);
+    allMembers.forEach(m => { if (m.upline && downlineCounts.hasOwnProperty(m.upline)) downlineCounts[m.upline]++; });
+
+    // Node & Link Templates
+    diagram.nodeTemplate = $(go.Node, "Horizontal", 
+        $(go.Panel, "Auto", $(go.Shape, "RoundedRectangle", { strokeWidth: 2 }, new go.Binding("stroke", "key", k => downlineCounts[k]>=5?"gold":"white"), new go.Binding("fill", "key", k => downlineCounts[k]>=5?"#1a1a1a":"#111")),
+        $(go.TextBlock, { margin: 10, font: "bold 14px sans-serif", stroke:"white" }, new go.Binding("text", "label"))),
+        $("TreeExpanderButton", { width: 20, height: 20, "ButtonBorder.fill": "white" })
+    );
+    diagram.linkTemplate = $(go.Link, { routing: go.Link.Orthogonal, corner: 10 }, $(go.Shape, { strokeWidth: 2, stroke: "white" }));
+
+    const nodes = membersToRender.map(m => {
+        let dateFmt = 'N/A';
+        if(m.joinDate) { const d = new Date(m.joinDate); dateFmt = `${String(d.getDate()).padStart(2,'0')}-${String(d.getMonth()+1).padStart(2,'0')}`; }
+        return { key: m.uid, label: `${m.uid}\n${m.name}\n${dateFmt}` };
+    });
+    const links = membersToRender.filter(m => m.upline).map(m => ({ from: m.upline, to: m.uid }));
+    diagram.model = new go.GraphLinksModel(nodes, links);
+    
+    if (focusedMemberUid) {
+        const n = diagram.findNodeForKey(focusedMemberUid);
+        if(n) { diagram.centerRect(n.actualBounds); sessionStorage.removeItem('focusedMemberUid'); }
+    }
+}
+
+function downloadNetworkImage() {
+    if (!diagram) return;
+    const img = diagram.makeImage({ scale: 1, background: "#121212", padding: new go.Margin(50, 50, 50, 50) });
+    const link = document.createElement('a');
+    link.href = img.src; link.download = 'jaringan.png';
+    document.body.appendChild(link); link.click(); document.body.removeChild(link);
+}
